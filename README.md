@@ -1,10 +1,16 @@
-# AuthCore
+> ⚠️ **Experimental Research Repository**
+>
+> AuthCore-AI is an experimental spin-off of my core authentication service, [AuthCore](https://github.com/koray-killi/AuthCore).
+> While the main repository focuses on deterministic application security, this repository serves as a
+> DevSecOps research playground to explore how LLMs (Claude 5.5 Sonnet) can be implemented as
+> asynchronous SIEM agents to detect anomalies in audit logs.
+>
+> **Core auth logic remains 100% deterministic.** The AI layer is a cold-path observer that never
+> intercepts or modifies the authentication request flow.
 
-A production-discipline authentication and session management microservice written in Go. I built this to sharpen my understanding of identity and access management by implementing the hard parts from scratch — refresh token rotation, OTP verification, account lockout, audit logging — rather than delegating them to a library.
+# AuthCore-AI
 
-> **About:** AuthCore is a personal project I built from scratch to practice and consolidate the
-> backend and application-security patterns I learned during my internship. It shares no
-> code with any proprietary codebase.
+A production-discipline authentication service with an experimental AI-powered SIEM layer. Claude 5.5 Sonnet analyzes append-only audit logs as an asynchronous security analyst — detecting slow brute-force attacks, impossible travel anomalies, and credential stuffing patterns that static rate limiters miss.
 
 ---
 
@@ -32,47 +38,27 @@ Most auth tutorials hand you a JWT package and call it done. I wanted to see wha
 
 ---
 
-## Architecture
+## Architecture Overview
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                         HTTP Client                              │
-└─────────────────────────────┬────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                      Middleware Stack                            │
-│  RealIP → Rate Limiter → Security Headers → Request Logger       │
-│  CORS → Body Limit (1 MB) → JWT Auth (protected routes)         │
-└─────────────────────────────┬────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                       Handler Layer                              │
-│  Route → DTO validation → Service call → Response DTO → JSON    │
-│  All errors go through httperr — handlers never write raw errors │
-└─────────────────────────────┬────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                       Service Layer                              │
-│  auth_service · token_service · otp_service · audit_service     │
-│  All business rules live here — no SQL, no HTTP knowledge        │
-└─────────────────────────────┬────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                     Repository Layer                             │
-│  user_repo · session_repo · otp_repo · audit_repo               │
-│  Hand-written SQL via pgx/v5 — no ORM, no magic                 │
-└─────────────────────────────┬────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                      PostgreSQL 16                               │
-│  users · refresh_sessions · otp_codes · audit_logs              │
-│  golang-migrate — idempotent migrations on startup              │
-└──────────────────────────────────────────────────────────────────┘
+```text
+┌─────────────────────────────────────────────────────────────┐
+│              HOT PATH (Deterministic Core)                  │
+│                                                             │
+│  HTTP ──▶ Rate Limiter ──▶ Handler ──▶ Service ──▶ Repo    │
+│                                                     │       │
+│                                              audit_logs     │
+│                                             (append-only)   │
+└──────────────────────────────────────┬──────────────────────┘
+                                       │ read-only
+                              ╔════════╧════════╗
+                              ║   COLD PATH     ║
+                              ║   (AI Observer)  ║
+                              ╚════════╤════════╝
+                                       │
+            ┌──────────┬───────────────┼───────────┐
+            ▼          ▼               ▼           ▼
+      Batch Reader  Sanitizer   Claude API   Report Store
+      (cursor)      (PII mask)  (async)      (anomalies)
 ```
 
 ---
@@ -95,6 +81,9 @@ These aren't just documented — they're enforced by the layer boundaries:
 | Config injected, no global mutable state | `config.Config` passed through all constructors |
 | Three-tier rate limiter (IP + account + email) | In-memory sliding window behind `RateLimiter` interface |
 | Email format validated before processing | RFC-5322 regex in `middleware.ValidateEmail()` |
+| **AI layer is cold-path only** | Claude never intercepts auth requests; operates on read-only audit log snapshots |
+| **PII sanitized before API transmission** | Email addresses and IP octets are masked before leaving the server |
+| **AI failure is non-disruptive** | If Claude API is unavailable, core auth continues with zero degradation |
 
 ---
 
@@ -110,6 +99,11 @@ These aren't just documented — they're enforced by the layer boundaries:
 ```bash
 # Copy the example environment file and set your JWT secret
 cp .env.example .env
+
+# Optional: Enable AI SIEM layer
+# Add your Anthropic API key to .env:
+# ANTHROPIC_API_KEY=sk-ant-...
+# The SIEM worker starts automatically when the key is present.
 
 # Start Postgres, MailHog, and the app
 docker compose up --build -d
@@ -133,6 +127,35 @@ export SMTP_HOST=localhost
 export SMTP_PORT=1025
 
 make run
+```
+
+---
+
+## AI SIEM Worker Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | — | Anthropic API key. Worker only starts when set. |
+| `SIEM_SCAN_INTERVAL` | `5m` | How often the worker scans for new audit logs |
+| `SIEM_BATCH_SIZE` | `100` | Number of logs per analysis batch |
+| `SIEM_ENABLED` | `true` | Kill switch. Set to `false` to disable even with API key set. |
+
+---
+
+## Sample Anomaly Report
+
+```json
+{
+  "anomaly_type": "geo_impossible_travel",
+  "severity": "high",
+  "description": "User u***r-uuid logged in from 192.168.xxx.xxx (Istanbul, TR) at 14:03 UTC and from 10.0.xxx.xxx (São Paulo, BR) at 14:07 UTC. A 4-minute interval between two cities 10,200 km apart implies compromised credentials.",
+  "affected_users": ["<user-uuid>"],
+  "evidence": {
+    "login_1": {"masked_ip": "192.168.xxx.xxx", "timestamp": "2025-01-15T14:03:22Z", "action": "login"},
+    "login_2": {"masked_ip": "10.0.xxx.xxx", "timestamp": "2025-01-15T14:07:11Z", "action": "login"}
+  },
+  "recommended_action": "Force session revocation and notify user via email"
+}
 ```
 
 ---
@@ -183,49 +206,6 @@ Full request/response examples are in [`docs/api.md`](docs/api.md).
 
 ---
 
-## Try It with curl
-
-```bash
-BASE=http://localhost:8080/api/v1
-
-# Register
-curl -s -X POST "$BASE/auth/register" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","password":"supersecure1"}' | jq
-
-# Grab the OTP from MailHog
-OTP=$(curl -s http://localhost:8025/api/v2/messages \
-  | python3 -c "import sys,json,re; d=json.load(sys.stdin); [print(m.group(1)) for i in d['items'] for m in [re.search(r'\\b([0-9]{6})\\b', i['Content']['Body'])] if m]" | head -1)
-
-# Verify email
-curl -s -X POST "$BASE/auth/verify-email" \
-  -H "Content-Type: application/json" \
-  -d "{\"email\":\"you@example.com\",\"code\":\"$OTP\"}" | jq
-
-# Login (saves the refresh cookie)
-ACCESS=$(curl -s -X POST "$BASE/auth/login" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","password":"supersecure1"}' \
-  -c cookies.txt | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
-
-# Get your profile
-curl -s "$BASE/auth/me" -H "Authorization: Bearer $ACCESS" | jq
-
-# Rotate the refresh token
-curl -s -X POST "$BASE/auth/refresh" -b cookies.txt -c cookies.txt | jq
-
-# Forgot your OTP limit? Request a new one
-curl -s -X POST "$BASE/auth/resend-verification" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com"}' | jq
-
-# Logout
-curl -s -X POST "$BASE/auth/logout" \
-  -H "Authorization: Bearer $ACCESS" -b cookies.txt | jq
-```
-
----
-
 ## Testing
 
 ```bash
@@ -248,19 +228,20 @@ The unit test suite covers the service layer with fake repositories (~78% covera
 ## Project Layout
 
 ```
-AuthCore/
+AuthCore-AI/
 ├── cmd/authcore/main.go          # Wires everything together, starts the server
 ├── internal/
 │   ├── config/                   # Loads config from environment
 │   ├── database/                 # pgxpool connection + golang-migrate runner
-│   ├── domain/                   # Entities (User, RefreshSession) + typed errors
+│   ├── domain/                   # Entities (User, RefreshSession, AnomalyReport)
 │   ├── repository/               # SQL access — pure data, no business logic
 │   ├── service/                  # All business rules live here
 │   ├── handler/                  # HTTP handlers, DTOs, chi router
 │   ├── middleware/               # JWT auth, rate limiting, request logging
 │   ├── httperr/                  # Typed error → JSON response mapping
-│   └── mailer/                   # Mailer interface + SMTP implementation
-├── migrations/                   # Up/down SQL files
+│   ├── mailer/                   # Mailer interface + SMTP implementation
+│   └── siem/                     # AI SIEM Worker (Claude integration & PII sanitizer)
+├── migrations/                   # Up/down SQL files (including anomaly_reports)
 ├── docs/                         # Architecture, ADRs, API reference
 ├── Dockerfile                    # Multi-stage build (~20 MB final image)
 ├── docker-compose.yml            # Dev: Postgres + MailHog + app
@@ -272,11 +253,21 @@ AuthCore/
 
 ## Roadmap
 
+- [x] Append-only audit log infrastructure
+- [ ] Claude 5.5 Sonnet SIEM integration (see #1)
+- [ ] GeoIP enrichment for impossible travel detection
+- [ ] Webhook alerts for critical anomalies
 - [ ] Redis-backed rate limiter (interface is already in place)
 - [ ] TOTP two-factor authentication
 - [ ] OAuth2 provider integration (Google, GitHub)
 - [ ] Password history (block reuse of last N passwords)
 - [ ] OpenTelemetry tracing
+
+---
+
+## Contributing
+
+Issues and Pull Requests are welcome!
 
 ---
 

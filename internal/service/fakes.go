@@ -341,6 +341,22 @@ func (r *FakeAuditRepo) GetLogs() []domain.AuditLog {
 	return result
 }
 
+func (r *FakeAuditRepo) ListAfterCursor(_ context.Context, after time.Time, limit int) ([]domain.AuditLog, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var result []domain.AuditLog
+	for _, l := range r.logs {
+		if l.CreatedAt.After(after) {
+			result = append(result, *l)
+			if len(result) >= limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
 // FakeMailer is a test mailer that records sent emails.
 type FakeMailer struct {
 	mu     sync.Mutex

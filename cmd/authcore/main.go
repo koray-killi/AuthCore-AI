@@ -17,6 +17,7 @@ import (
 	"github.com/koray-killi/AuthCore/internal/middleware"
 	"github.com/koray-killi/AuthCore/internal/repository"
 	"github.com/koray-killi/AuthCore/internal/service"
+	"github.com/koray-killi/AuthCore/internal/siem"
 	"go.uber.org/zap"
 )
 
@@ -82,6 +83,30 @@ func main() {
 		rateLimiter,
 	)
 
+	// Create a root context with cancellation for graceful shutdown of background workers
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start AI SIEM worker if configured.
+	// The worker is a cold-path observer: it reads audit logs asynchronously
+	// and never intercepts the authentication request flow.
+	if cfg.AI.Enabled && cfg.AI.APIKey != "" {
+		claudeClient := siem.NewClaudeClient(cfg.AI.APIKey, cfg.AI.BaseURL, logger)
+		sanitizer := siem.NewSanitizer()
+		siemWorker := siem.NewWorker(siem.WorkerConfig{
+			ScanInterval: cfg.AI.ScanInterval,
+			BatchSize:    cfg.AI.BatchSize,
+		}, auditRepo, claudeClient, sanitizer, logger)
+
+		go siemWorker.Run(ctx)
+		logger.Info("SIEM worker started",
+			zap.Duration("scan_interval", cfg.AI.ScanInterval),
+			zap.Int("batch_size", cfg.AI.BatchSize),
+		)
+	} else {
+		logger.Info("SIEM worker disabled (ANTHROPIC_API_KEY not set or SIEM_ENABLED=false)")
+	}
+
 	// Create HTTP server.
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.ServerPort),
@@ -104,12 +129,14 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
+	cancel() // Trigger graceful shutdown for SIEM worker and other context-aware goroutines
+
 	logger.Info("shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.ServerShutdownTimeout)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ServerShutdownTimeout)
+	defer shutdownCancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Fatal("server forced to shutdown", zap.Error(err))
 	}
 

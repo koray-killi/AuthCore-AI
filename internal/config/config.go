@@ -26,6 +26,18 @@ type Config struct {
 	CORSAllowedOrigins []string
 
 	RateLimit RateLimitConfig
+
+	AI AIConfig
+}
+
+// AIConfig holds configuration for the AI SIEM worker.
+// The worker only starts when APIKey is non-empty and Enabled is true.
+type AIConfig struct {
+	Enabled      bool
+	APIKey       string
+	ScanInterval time.Duration
+	BatchSize    int
+	BaseURL      string // Anthropic API base URL, for testing overrides
 }
 
 // JWTConfig holds JWT-related configuration.
@@ -91,6 +103,14 @@ func Load() (*Config, error) {
 			AccountWindow:   getEnvDuration("RATE_LIMIT_ACCOUNT_WINDOW", 1*time.Minute),
 			EmailRequests:   getEnvInt("RATE_LIMIT_EMAIL_REQUESTS", 3),
 			EmailWindow:     getEnvDuration("RATE_LIMIT_EMAIL_WINDOW", 10*time.Minute),
+		},
+
+		AI: AIConfig{
+			Enabled:      getEnv("SIEM_ENABLED", "true") == "true",
+			APIKey:       getEnv("ANTHROPIC_API_KEY", ""),
+			ScanInterval: getEnvDuration("SIEM_SCAN_INTERVAL", 5*time.Minute),
+			BatchSize:    getEnvInt("SIEM_BATCH_SIZE", 100),
+			BaseURL:      getEnv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
 		},
 	}
 

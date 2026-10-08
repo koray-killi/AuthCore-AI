@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,6 +16,10 @@ type AuditRepository interface {
 	Insert(ctx context.Context, log *domain.AuditLog) error
 	ListByUserID(ctx context.Context, userID uuid.UUID, page, pageSize int) ([]domain.AuditLog, int, error)
 	ListAll(ctx context.Context, page, pageSize int) ([]domain.AuditLog, int, error)
+	// ListAfterCursor returns audit logs created after the given cursor timestamp,
+	// ordered by created_at ASC, limited to `limit` rows.
+	// This is used by the SIEM worker for incremental batch processing.
+	ListAfterCursor(ctx context.Context, after time.Time, limit int) ([]domain.AuditLog, error)
 }
 
 type pgxAuditRepo struct {
@@ -102,4 +107,35 @@ func (r *pgxAuditRepo) scanLogs(ctx context.Context, query string, total int, ar
 	}
 
 	return logs, total, rows.Err()
+}
+
+func (r *pgxAuditRepo) ListAfterCursor(ctx context.Context, after time.Time, limit int) ([]domain.AuditLog, error) {
+	query := `
+		SELECT id, user_id, action, ip::text, user_agent, metadata, created_at
+		FROM audit_logs
+		WHERE created_at > $1
+		ORDER BY created_at ASC
+		LIMIT $2`
+
+	rows, err := r.pool.Query(ctx, query, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var logs []domain.AuditLog
+	for rows.Next() {
+		var log domain.AuditLog
+		var ip string
+		var metadataJSON []byte
+		if err := rows.Scan(&log.ID, &log.UserID, &log.Action, &ip, &log.UserAgent, &metadataJSON, &log.CreatedAt); err != nil {
+			return nil, err
+		}
+		log.IP = ip
+		if err := json.Unmarshal(metadataJSON, &log.Metadata); err != nil {
+			log.Metadata = map[string]interface{}{}
+		}
+		logs = append(logs, log)
+	}
+	return logs, rows.Err()
 }
